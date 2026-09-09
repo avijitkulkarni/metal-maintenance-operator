@@ -533,6 +533,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&systemctrl.FirmwareUpdateHPEReconciler{
+		Client:                      mgr.GetClient(),
+		ManagerNamespace:            managerNamespace,
+		Scheme:                      mgr.GetScheme(),
+		ResyncInterval:              resyncInterval,
+		Conditions:                  accessor,
+		DefaultFailedAutoRetryCount: int32(defaultFailedAutoRetryCountInt),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create FirmwareUpdateHPE controller")
+		os.Exit(1)
+	}
+
 	if err = (&systemctrl.BIOSSettingsSetReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
