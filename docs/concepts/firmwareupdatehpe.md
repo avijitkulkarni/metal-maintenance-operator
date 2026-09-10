@@ -105,3 +105,18 @@ spec:
 | 3 — Stub updater interface | `internal/controller/system/firmwareupdatehpe_updater.go` | Done |
 | 4 — Controller | `internal/controller/system/firmwareupdatehpe_controller.go` | Done |
 | 5 — Scheme + registration | `cmd/main.go` | Done |
+
+## Docker Image
+
+The controller image including HPE firmware update support is available at:
+
+```
+hecawxrepo.int.repositories.cloud.sap/metal-maintenance-operator-hpe:v1.0
+```
+
+Branch: `feature/firmware-update-hpe` on fork `avijitkulkarni/metal-maintenance-operator`
+
+## Pending
+
+- **CRD YAML generation** — run `controller-gen rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases` on a Linux machine or CI to generate the CRD manifest under `config/crd/bases/`. This must be applied to the cluster before the controller can manage `FirmwareUpdateHPE` resources.
+- **Real HPE iLO client** — replace `stubHPERepositoryUpdater` in `internal/controller/system/firmwareupdatehpe_updater.go` with a real implementation once metal-operator adds HPE-specific Redfish operations.
