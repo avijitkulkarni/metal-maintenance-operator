@@ -58,6 +58,9 @@ type FirmwareUpdateHPEReconciler struct {
 // +kubebuilder:rbac:groups=system.metal.ironcore.dev,resources=firmwareupdatehpes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=system.metal.ironcore.dev,resources=firmwareupdatehpes/finalizers,verbs=update
 // +kubebuilder:rbac:groups=metal.ironcore.dev,resources=servers,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=metal.ironcore.dev,resources=bmcs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=metal.ironcore.dev,resources=bmcsecrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=metal.ironcore.dev,resources=endpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups=maintenance.metal.ironcore.dev,resources=servermaintenances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=maintenance.metal.ironcore.dev,resources=servermaintenances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
@@ -110,12 +113,18 @@ func (r *FirmwareUpdateHPEReconciler) delete(ctx context.Context, fw *systemv1al
 		return ctrl.Result{}, nil
 	}
 
-	// Best-effort: delete the iLO InstallSet if one was created. The stub will fail here;
-	// a non-fatal error is acceptable — the InstallSet will expire in iLO on its own.
-	if fw.Status.InstallSetURI != "" {
-		updater := newHPERepositoryUpdater()
-		if err := updater.DeleteInstallSet(ctx, fw.Status.InstallSetURI); err != nil {
-			log.V(1).Info("Failed to delete InstallSet from iLO (non-fatal, proceeding with cleanup)", "InstallSetURI", fw.Status.InstallSetURI, "error", err)
+	// Best-effort: delete the iLO InstallSet if one was created.
+	if fw.Status.InstallSetURI != "" && fw.Spec.ServerRef != nil {
+		if server, err := utils.GetServerByName(ctx, r.Client, fw.Spec.ServerRef.Name); err == nil {
+			if updater, err := r.buildILOClient(ctx, server); err == nil {
+				if err := updater.DeleteInstallSet(ctx, fw.Status.InstallSetURI); err != nil {
+					log.V(1).Info("Failed to delete InstallSet from iLO (non-fatal, proceeding with cleanup)", "InstallSetURI", fw.Status.InstallSetURI, "error", err)
+				}
+			} else {
+				log.V(1).Info("Failed to build iLO client for InstallSet cleanup (non-fatal)", "error", err)
+			}
+		} else {
+			log.V(1).Info("Server not found for InstallSet cleanup (non-fatal)", "Server", fw.Spec.ServerRef.Name, "error", err)
 		}
 	}
 
@@ -194,7 +203,10 @@ func (r *FirmwareUpdateHPEReconciler) transitionState(ctx context.Context, fw *s
 		return false, fmt.Errorf("failed to fetch server: %w", err)
 	}
 
-	updater := newHPERepositoryUpdater()
+	updater, err := r.buildILOClient(ctx, server)
+	if err != nil {
+		return false, fmt.Errorf("failed to build iLO client for server %s: %w", server.Name, err)
+	}
 
 	switch fw.Status.State {
 	case "", systemv1alpha1.FirmwareUpdateHPEStatePending:
@@ -430,19 +442,29 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		return nil, fmt.Errorf("failed to fetch iLO FirmwareInventory: %w", err)
 	}
 
-	installedVersions := make(map[string]string, len(inventory))
+	installedVersions := make(map[string]string)
 	for _, e := range inventory {
-		installedVersions[e.TargetGUID] = e.Version
+		for _, guid := range e.Targets {
+			installedVersions[guid] = e.Version
+		}
 	}
 
 	applyDowngrade := fw.Spec.ApplyDowngradeVersions != nil && *fw.Spec.ApplyDowngradeVersions
 
 	var toUpdate []SPPManifestEntry
 	for _, pkg := range manifest {
-		if !isOOBFlashable(pkg.UpdatableBy) {
+		if !isOOBFlashable(pkg) {
 			continue
 		}
-		currentVersion, found := installedVersions[pkg.TargetGUID]
+		var currentVersion string
+		var found bool
+		for _, guid := range pkg.TargetGUIDs {
+			if v, ok := installedVersions[guid]; ok {
+				currentVersion = v
+				found = true
+				break
+			}
+		}
 		if !found {
 			continue
 		}
@@ -468,9 +490,12 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 	return toUpdate, nil
 }
 
-// isOOBFlashable reports whether a component can be flashed out-of-band (without an OS agent).
-func isOOBFlashable(updatableBy []string) bool {
-	for _, u := range updatableBy {
+// isOOBFlashable reports whether a component can be flashed out-of-band via iLO.
+func isOOBFlashable(pkg SPPManifestEntry) bool {
+	if pkg.DirectFlashOK {
+		return true
+	}
+	for _, u := range pkg.UpdatableBy {
 		if u == "Bmc" || u == "Uefi" {
 			return true
 		}
@@ -847,6 +872,58 @@ func (r *FirmwareUpdateHPEReconciler) enqueueHPEByBMC(ctx context.Context, obj c
 		}
 	}
 	return reqs
+}
+
+// buildILOClient resolves the iLO connection parameters for the given server and
+// returns a real hpeRepositoryUpdater backed by the iLO Redfish API.
+// It supports both the BMCRef (external BMC CR) and inline BMCAccess patterns.
+func (r *FirmwareUpdateHPEReconciler) buildILOClient(ctx context.Context, server *metalv1alpha1.Server) (hpeRepositoryUpdater, error) {
+	var host, username, password string
+
+	if server.Spec.BMCRef != nil {
+		bmc := &metalv1alpha1.BMC{}
+		if err := r.Get(ctx, client.ObjectKey{Name: server.Spec.BMCRef.Name}, bmc); err != nil {
+			return nil, fmt.Errorf("getting BMC %s: %w", server.Spec.BMCRef.Name, err)
+		}
+
+		switch {
+		case bmc.Spec.Endpoint != nil:
+			host = bmc.Spec.Endpoint.IP.String()
+		case bmc.Spec.EndpointRef != nil:
+			endpoint := &metalv1alpha1.Endpoint{}
+			if err := r.Get(ctx, client.ObjectKey{Name: bmc.Spec.EndpointRef.Name}, endpoint); err != nil {
+				return nil, fmt.Errorf("getting Endpoint %s: %w", bmc.Spec.EndpointRef.Name, err)
+			}
+			host = endpoint.Spec.IP.String()
+		default:
+			return nil, fmt.Errorf("BMC %s has neither inline endpoint nor endpointRef", bmc.Name)
+		}
+
+		bmcSecret := &metalv1alpha1.BMCSecret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: bmc.Spec.BMCSecretRef.Name}, bmcSecret); err != nil {
+			return nil, fmt.Errorf("getting BMCSecret %s: %w", bmc.Spec.BMCSecretRef.Name, err)
+		}
+		username = string(bmcSecret.Data[metalv1alpha1.BMCSecretUsernameKeyName])
+		password = string(bmcSecret.Data[metalv1alpha1.BMCSecretPasswordKeyName])
+
+	} else if server.Spec.BMC != nil {
+		host = server.Spec.BMC.Address
+		bmcSecret := &metalv1alpha1.BMCSecret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: server.Spec.BMC.BMCSecretRef.Name}, bmcSecret); err != nil {
+			return nil, fmt.Errorf("getting BMCSecret %s: %w", server.Spec.BMC.BMCSecretRef.Name, err)
+		}
+		username = string(bmcSecret.Data[metalv1alpha1.BMCSecretUsernameKeyName])
+		password = string(bmcSecret.Data[metalv1alpha1.BMCSecretPasswordKeyName])
+
+	} else {
+		return nil, fmt.Errorf("server %s has neither BMCRef nor inline BMC configuration", server.Name)
+	}
+
+	return newHPERepositoryUpdater(iloClientConfig{
+		Host:     host,
+		Username: username,
+		Password: password,
+	}), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
