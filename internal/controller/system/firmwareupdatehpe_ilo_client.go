@@ -69,7 +69,7 @@ type iloInstallSetBody struct {
 // ─── SPP metadata.json JSON types ────────────────────────────────────────────
 
 type sppMetadata struct {
-	Packages []sppProduct `json:"Packages"`
+	Components []sppProduct `json:"Components"`
 }
 
 type sppProduct struct {
@@ -239,7 +239,7 @@ func (c *iloClient) GetSPPManifest(ctx context.Context, baseURI, username, passw
 	}
 
 	var result []SPPManifestEntry
-	for _, product := range meta.Packages {
+	for _, product := range meta.Components {
 		for _, ver := range product.Versions {
 			// Determine if any firmware image in this version supports direct flash.
 			directFlashOK := false
