@@ -286,7 +286,7 @@ func localizedString(entries []sppLocalizedText, lang string) string {
 
 // AddFromUri instructs iLO to download the package at packageURI into its ComponentRepository.
 func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) error {
-	const actionPath = "/redfish/v1/UpdateService/Actions/UpdateService.AddFromUri"
+	const actionPath = "/redfish/v1/UpdateService/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri"
 	body := map[string]string{"ImageURI": packageURI}
 	resp, err := c.post(ctx, actionPath, body)
 	if err != nil {
