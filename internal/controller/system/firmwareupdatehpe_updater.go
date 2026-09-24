@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net/http"
+	"net/url"
 )
 
 // HPEFirmwareEntry represents a single firmware component as reported by iLO's FirmwareInventory.
@@ -98,9 +99,12 @@ func newHPERepositoryUpdater(cfg iloClientConfig) hpeRepositoryUpdater {
 		username: cfg.Username,
 		password: cfg.Password,
 		// iLO uses self-signed TLS certificates; skip verification as is standard for iLO deployments.
+		// Proxy is set to a no-op to bypass any HTTP_PROXY/HTTPS_PROXY environment variables —
+		// iLO is on the management network and must be reached directly.
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+				Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil },
 			},
 		},
 	}

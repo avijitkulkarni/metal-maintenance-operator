@@ -387,6 +387,8 @@ func (r *FirmwareUpdateHPEReconciler) requestServerMaintenance(ctx context.Conte
 	opResult, err := controllerutil.CreateOrPatch(ctx, r.Client, serverMaintenance, func() error {
 		if fw.Spec.ServerMaintenancePolicy != nil {
 			serverMaintenance.Spec.Policy = *fw.Spec.ServerMaintenancePolicy
+		} else {
+			serverMaintenance.Spec.Policy = maintenancev1alpha1.ServerMaintenancePolicyEnforced
 		}
 		serverMaintenance.Spec.ServerRef = &corev1.LocalObjectReference{Name: server.Name}
 		if serverMaintenance.Status.State != maintenancev1alpha1.ServerMaintenanceStateInMaintenance && serverMaintenance.Status.State != "" {
