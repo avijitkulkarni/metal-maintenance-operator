@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strings"
+	"time"
 )
 
 // iloClient implements hpeRepositoryUpdater against the HPE iLO 5 Redfish API.
@@ -285,15 +287,27 @@ func localizedString(entries []sppLocalizedText, lang string) string {
 }
 
 // AddFromUri instructs iLO to download the package at packageURI into its ComponentRepository.
+// iLO only allows one upload at a time; retries up to 10 times with a 30s backoff when busy.
 func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) error {
 	const actionPath = "/redfish/v1/UpdateService/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri"
 	body := map[string]string{"ImageURI": packageURI}
-	resp, err := c.post(ctx, actionPath, body)
-	if err != nil {
-		return fmt.Errorf("AddFromUri %s: %w", packageURI, err)
+	for attempt := 0; attempt < 10; attempt++ {
+		resp, err := c.post(ctx, actionPath, body)
+		if err != nil {
+			if strings.Contains(err.Error(), "ComponentUploadAlreadyInProgress") {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(30 * time.Second):
+					continue
+				}
+			}
+			return fmt.Errorf("AddFromUri %s: %w", packageURI, err)
+		}
+		resp.Body.Close()
+		return nil
 	}
-	resp.Body.Close()
-	return nil
+	return fmt.Errorf("AddFromUri %s: iLO upload slot still busy after retries", packageURI)
 }
 
 // CreateInstallSet creates an HPE InstallSet with one ApplyUpdate entry per filename
