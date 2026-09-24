@@ -103,8 +103,9 @@ func newHPERepositoryUpdater(cfg iloClientConfig) hpeRepositoryUpdater {
 		// iLO is on the management network and must be reached directly.
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-				Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil },
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+				Proxy:             func(*http.Request) (*url.URL, error) { return nil, nil },
+				DisableKeepAlives: true,
 			},
 		},
 	}
