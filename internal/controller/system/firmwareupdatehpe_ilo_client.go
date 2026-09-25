@@ -314,6 +314,30 @@ func (c *iloClient) getComponentFilenames(ctx context.Context) (map[string]struc
 	return result, nil
 }
 
+// componentMatchesURI reports whether a ComponentRepository filename corresponds to
+// the package at packageURI. iLO stores files under an internal name (e.g.
+// /firmware-system-u34-3.66_04_01_2026.fwpkg) that differs from the URL basename
+// (U34_3.66_04_01_2026.fwpkg), so we normalise both sides before comparing.
+func componentMatchesURI(filename, packageURI string) bool {
+	normalise := func(s string) string {
+		// Take basename, strip extension, lowercase, replace separators with space.
+		if i := strings.LastIndexByte(s, '/'); i >= 0 {
+			s = s[i+1:]
+		}
+		if i := strings.LastIndexByte(s, '.'); i > 0 {
+			s = s[:i]
+		}
+		s = strings.ToLower(s)
+		for _, r := range []string{"-", "_", "."} {
+			s = strings.ReplaceAll(s, r, " ")
+		}
+		return s
+	}
+	fileNorm := normalise(filename)
+	uriNorm := normalise(packageURI)
+	return strings.Contains(fileNorm, uriNorm) || strings.Contains(uriNorm, fileNorm)
+}
+
 // AddFromUri instructs iLO to download the package at packageURI into its ComponentRepository.
 // It waits until the file appears in the ComponentRepository and returns the actual Filename
 // as stored by iLO (which may differ from the URL basename).
@@ -349,14 +373,24 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 		return "", fmt.Errorf("AddFromUri %s: iLO upload slot still busy after retries", packageURI)
 	}
 
-	// Poll until a new entry appears in ComponentRepository — iLO may name it differently from the URL.
+	// Poll ComponentRepository until the staged file is visible.
+	// Two strategies handle both fresh staging (new entry appears) and re-staging
+	// (same entry updated in-place, no new entry): prefer a new entry, fall back to
+	// a fuzzy match on entries that were already present before the AddFromUri call.
 	for attempt := 0; attempt < 20; attempt++ {
 		after, err := c.getComponentFilenames(ctx)
 		if err != nil {
 			return "", fmt.Errorf("AddFromUri %s: polling ComponentRepository: %w", packageURI, err)
 		}
+		// Prefer a brand-new entry (first staging scenario).
 		for filename := range after {
 			if _, seen := before[filename]; !seen {
+				return filename, nil
+			}
+		}
+		// Fall back: file was already staged; iLO updated it in-place.
+		for filename := range after {
+			if componentMatchesURI(filename, packageURI) {
 				return filename, nil
 			}
 		}
