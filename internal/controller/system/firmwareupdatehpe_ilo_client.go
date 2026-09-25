@@ -259,6 +259,9 @@ func (c *iloClient) GetSPPManifest(ctx context.Context, baseURI, username, passw
 				if len(f.TargetGUIDs) == 0 {
 					continue
 				}
+				if !strings.HasSuffix(strings.ToLower(f.Name), ".fwpkg") {
+					continue
+				}
 				result = append(result, SPPManifestEntry{
 					TargetGUIDs:   f.TargetGUIDs,
 					Version:       f.Version,
@@ -286,28 +289,84 @@ func localizedString(entries []sppLocalizedText, lang string) string {
 	return ""
 }
 
+// iloComponentEntry represents a single entry in iLO's ComponentRepository.
+type iloComponentEntry struct {
+	Filename string `json:"Filename"`
+}
+
+// getComponentFilenames returns the current set of Filename values in the ComponentRepository.
+func (c *iloClient) getComponentFilenames(ctx context.Context) (map[string]struct{}, error) {
+	const repoPath = "/redfish/v1/UpdateService/ComponentRepository"
+	var coll iloCollection
+	if err := c.get(ctx, repoPath, &coll); err != nil {
+		return nil, fmt.Errorf("listing ComponentRepository: %w", err)
+	}
+	result := make(map[string]struct{}, len(coll.Members))
+	for _, m := range coll.Members {
+		var entry iloComponentEntry
+		if err := c.get(ctx, m.ODataID, &entry); err != nil {
+			return nil, fmt.Errorf("fetching ComponentRepository entry %s: %w", m.ODataID, err)
+		}
+		if entry.Filename != "" {
+			result[entry.Filename] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
 // AddFromUri instructs iLO to download the package at packageURI into its ComponentRepository.
+// It waits until the file appears in the ComponentRepository and returns the actual Filename
+// as stored by iLO (which may differ from the URL basename).
 // iLO only allows one upload at a time; retries up to 10 times with a 30s backoff when busy.
-func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) error {
+func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, error) {
 	const actionPath = "/redfish/v1/UpdateService/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri"
+
+	before, err := c.getComponentFilenames(ctx)
+	if err != nil {
+		return "", fmt.Errorf("AddFromUri %s: snapshot ComponentRepository: %w", packageURI, err)
+	}
+
 	body := map[string]string{"ImageURI": packageURI}
+	posted := false
 	for attempt := 0; attempt < 10; attempt++ {
 		resp, err := c.post(ctx, actionPath, body)
 		if err != nil {
 			if strings.Contains(err.Error(), "ComponentUploadAlreadyInProgress") {
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return "", ctx.Err()
 				case <-time.After(30 * time.Second):
 					continue
 				}
 			}
-			return fmt.Errorf("AddFromUri %s: %w", packageURI, err)
+			return "", fmt.Errorf("AddFromUri %s: %w", packageURI, err)
 		}
 		resp.Body.Close()
-		return nil
+		posted = true
+		break
 	}
-	return fmt.Errorf("AddFromUri %s: iLO upload slot still busy after retries", packageURI)
+	if !posted {
+		return "", fmt.Errorf("AddFromUri %s: iLO upload slot still busy after retries", packageURI)
+	}
+
+	// Poll until a new entry appears in ComponentRepository — iLO may name it differently from the URL.
+	for attempt := 0; attempt < 20; attempt++ {
+		after, err := c.getComponentFilenames(ctx)
+		if err != nil {
+			return "", fmt.Errorf("AddFromUri %s: polling ComponentRepository: %w", packageURI, err)
+		}
+		for filename := range after {
+			if _, seen := before[filename]; !seen {
+				return filename, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+	}
+	return "", fmt.Errorf("AddFromUri %s: timed out waiting for file to appear in ComponentRepository", packageURI)
 }
 
 // CreateInstallSet creates an HPE InstallSet with one ApplyUpdate entry per filename

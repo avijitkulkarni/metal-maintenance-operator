@@ -75,7 +75,8 @@ type hpeRepositoryUpdater interface {
 	GetSPPManifest(ctx context.Context, baseURI, username, password string) ([]SPPManifestEntry, error)
 
 	// AddFromUri instructs iLO to fetch the package at packageURI into its ComponentRepository.
-	AddFromUri(ctx context.Context, packageURI string) error
+	// Returns the actual Filename as stored by iLO in the ComponentRepository.
+	AddFromUri(ctx context.Context, packageURI string) (string, error)
 
 	// CreateInstallSet creates a new InstallSet in iLO containing one ApplyUpdate entry per component
 	// filename plus a final ResetServer step. Returns the Redfish URI of the created InstallSet.

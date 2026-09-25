@@ -6,7 +6,6 @@ package system
 import (
 	"context"
 	"fmt"
-	"path"
 	"time"
 
 	"github.com/ironcore-dev/controller-utils/clientutils"
@@ -518,10 +517,11 @@ func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *sys
 	filenames := make([]string, 0, len(components))
 	for _, pkg := range components {
 		packageURI := fw.Spec.Repository.BaseURI + "/" + pkg.PackagePath
-		if err := updater.AddFromUri(ctx, packageURI); err != nil {
+		filename, err := updater.AddFromUri(ctx, packageURI)
+		if err != nil {
 			return nil, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
 		}
-		filenames = append(filenames, path.Base(pkg.PackagePath))
+		filenames = append(filenames, filename)
 	}
 	return filenames, nil
 }
