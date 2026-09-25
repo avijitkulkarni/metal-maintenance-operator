@@ -314,13 +314,12 @@ func (c *iloClient) getComponentFilenames(ctx context.Context) (map[string]struc
 	return result, nil
 }
 
-// componentMatchesURI reports whether a ComponentRepository filename corresponds to
-// the package at packageURI. iLO stores files under an internal name (e.g.
-// /firmware-system-u34-3.66_04_01_2026.fwpkg) that differs from the URL basename
-// (U34_3.66_04_01_2026.fwpkg), so we normalise both sides before comparing.
+// componentMatchesURI reports whether a ComponentRepository filename corresponds to the
+// package at packageURI. iLO may store files under a name that differs from the URL
+// basename, so both sides are normalised (basename, extension stripped, lowercased,
+// separator-normalised) before comparing.
 func componentMatchesURI(filename, packageURI string) bool {
 	normalise := func(s string) string {
-		// Take basename, strip extension, lowercase, replace separators with space.
 		if i := strings.LastIndexByte(s, '/'); i >= 0 {
 			s = s[i+1:]
 		}
@@ -338,18 +337,69 @@ func componentMatchesURI(filename, packageURI string) bool {
 	return strings.Contains(fileNorm, uriNorm) || strings.Contains(uriNorm, fileNorm)
 }
 
-// AddFromUri instructs iLO to download the package at packageURI into its ComponentRepository.
-// It waits until the file appears in the ComponentRepository and returns the actual Filename
-// as stored by iLO (which may differ from the URL basename).
+// getTaskQueueURIs returns the set of @odata.id values currently in the UpdateTaskQueue.
+func (c *iloClient) getTaskQueueURIs(ctx context.Context) (map[string]struct{}, error) {
+	const taskQueuePath = "/redfish/v1/UpdateService/UpdateTaskQueue"
+	var coll iloCollection
+	if err := c.get(ctx, taskQueuePath, &coll); err != nil {
+		return nil, fmt.Errorf("listing UpdateTaskQueue: %w", err)
+	}
+	result := make(map[string]struct{}, len(coll.Members))
+	for _, m := range coll.Members {
+		result[m.ODataID] = struct{}{}
+	}
+	return result, nil
+}
+
+// checkComponentAfterStaging checks whether the staged file appeared in ComponentRepository.
+// Returns the Filename for use in an InstallSet ApplyUpdate entry, or "" if the firmware was
+// staged directly (e.g. System ROM/BIOS) and does not appear in ComponentRepository.
+func (c *iloClient) checkComponentAfterStaging(ctx context.Context, packageURI string, before map[string]struct{}) (string, error) {
+	after, err := c.getComponentFilenames(ctx)
+	if err != nil {
+		return "", fmt.Errorf("reading ComponentRepository after staging %s: %w", packageURI, err)
+	}
+	// New entry — fresh staging.
+	for filename := range after {
+		if _, seen := before[filename]; !seen {
+			return filename, nil
+		}
+	}
+	// Fuzzy match — re-staging of a file already present (same filename, updated in-place).
+	for filename := range after {
+		if componentMatchesURI(filename, packageURI) {
+			return filename, nil
+		}
+	}
+	// File not in ComponentRepository: firmware was staged directly (e.g. BIOS/System ROM).
+	// The caller should trigger a server reboot without an ApplyUpdate step.
+	return "", nil
+}
+
+// AddFromUri instructs iLO to download the package at packageURI.
+//
+// For firmware staged in ComponentRepository (iLO, NIC, storage controllers…), it returns the
+// Filename so the caller can include an ApplyUpdate entry in an InstallSet.
+//
+// For firmware applied directly without ComponentRepository staging (System ROM/BIOS), it
+// returns "" — the caller should trigger a server reboot without an ApplyUpdate entry; the
+// pending BIOS update will be applied automatically during POST.
+//
 // iLO only allows one upload at a time; retries up to 10 times with a 30s backoff when busy.
 func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, error) {
 	const actionPath = "/redfish/v1/UpdateService/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri"
 
-	before, err := c.getComponentFilenames(ctx)
+	// Snapshot ComponentRepository and UpdateTaskQueue before staging.
+	beforeFilenames, err := c.getComponentFilenames(ctx)
 	if err != nil {
 		return "", fmt.Errorf("AddFromUri %s: snapshot ComponentRepository: %w", packageURI, err)
 	}
+	beforeTaskURIs, err := c.getTaskQueueURIs(ctx)
+	if err != nil {
+		return "", fmt.Errorf("AddFromUri %s: snapshot UpdateTaskQueue: %w", packageURI, err)
+	}
 
+	// POST AddFromUri with retry for ComponentUploadAlreadyInProgress.
 	body := map[string]string{"ImageURI": packageURI}
 	posted := false
 	for attempt := 0; attempt < 10; attempt++ {
@@ -373,34 +423,58 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 		return "", fmt.Errorf("AddFromUri %s: iLO upload slot still busy after retries", packageURI)
 	}
 
-	// Poll ComponentRepository until the staged file is visible.
-	// Two strategies handle both fresh staging (new entry appears) and re-staging
-	// (same entry updated in-place, no new entry): prefer a new entry, fall back to
-	// a fuzzy match on entries that were already present before the AddFromUri call.
-	for attempt := 0; attempt < 20; attempt++ {
-		after, err := c.getComponentFilenames(ctx)
+	// Find the new UpdateTaskQueue entry created by our POST (up to 10 × 5s = 50s).
+	var taskURI string
+	for attempt := 0; attempt < 10; attempt++ {
+		currentURIs, err := c.getTaskQueueURIs(ctx)
 		if err != nil {
-			return "", fmt.Errorf("AddFromUri %s: polling ComponentRepository: %w", packageURI, err)
+			return "", fmt.Errorf("AddFromUri %s: finding task in UpdateTaskQueue: %w", packageURI, err)
 		}
-		// Prefer a brand-new entry (first staging scenario).
-		for filename := range after {
-			if _, seen := before[filename]; !seen {
-				return filename, nil
+		for uri := range currentURIs {
+			if _, seen := beforeTaskURIs[uri]; !seen {
+				taskURI = uri
+				break
 			}
 		}
-		// Fall back: file was already staged; iLO updated it in-place.
-		for filename := range after {
-			if componentMatchesURI(filename, packageURI) {
-				return filename, nil
-			}
+		if taskURI != "" {
+			break
 		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(15 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	}
-	return "", fmt.Errorf("AddFromUri %s: timed out waiting for file to appear in ComponentRepository", packageURI)
+
+	if taskURI == "" {
+		// Task not found — may have completed before our first poll.
+		// Fall back to a direct ComponentRepository check.
+		return c.checkComponentAfterStaging(ctx, packageURI, beforeFilenames)
+	}
+
+	// Monitor the task until it reaches a terminal state (up to 60 × 10s = 10 min).
+	for attempt := 0; attempt < 60; attempt++ {
+		var task iloTask
+		if err := c.get(ctx, taskURI, &task); err != nil {
+			return "", fmt.Errorf("AddFromUri %s: polling task %s: %w", packageURI, taskURI, err)
+		}
+		switch task.State {
+		case "Completed":
+			return c.checkComponentAfterStaging(ctx, packageURI, beforeFilenames)
+		case "Exception", "Killed", "Cancelled":
+			var msg string
+			if len(task.Messages) > 0 {
+				msg = task.Messages[0].Message
+			}
+			return "", fmt.Errorf("AddFromUri %s: task %s failed (state=%s): %s", packageURI, taskURI, task.State, msg)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+	return "", fmt.Errorf("AddFromUri %s: timed out waiting for task %s to complete", packageURI, taskURI)
 }
 
 // CreateInstallSet creates an HPE InstallSet with one ApplyUpdate entry per filename

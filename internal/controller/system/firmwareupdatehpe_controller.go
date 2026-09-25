@@ -511,8 +511,14 @@ func isDowngrade(current, candidate string) bool {
 	return candidate < current
 }
 
-// handleStaging calls AddFromUri for each component in the diff, staging the .fwpkg files
-// into iLO's ComponentRepository. Returns the .fwpkg filenames for use in CreateInstallSet.
+// handleStaging calls AddFromUri for each component in the diff.
+//
+// For firmware that iLO stages in ComponentRepository (iLO, NIC, storage…), AddFromUri
+// returns the actual Filename; these are collected for use in CreateInstallSet ApplyUpdate entries.
+//
+// For firmware applied directly by iLO without ComponentRepository staging (System ROM / BIOS),
+// AddFromUri returns "". These are omitted from the returned list; they are already pending
+// application on the next server reboot and do not need an ApplyUpdate step.
 func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, components []SPPManifestEntry, updater hpeRepositoryUpdater) ([]string, error) {
 	filenames := make([]string, 0, len(components))
 	for _, pkg := range components {
@@ -521,7 +527,11 @@ func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *sys
 		if err != nil {
 			return nil, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
 		}
-		filenames = append(filenames, filename)
+		if filename != "" {
+			// Firmware staged in ComponentRepository — include in InstallSet ApplyUpdate.
+			filenames = append(filenames, filename)
+		}
+		// filename == "": firmware staged directly (BIOS/System ROM); server reboot applies it.
 	}
 	return filenames, nil
 }
@@ -677,6 +687,7 @@ func (r *FirmwareUpdateHPEReconciler) handleConvergence(ctx context.Context, fw 
 
 // transitionFailed writes a Failed condition and transitions status.state to Failed.
 func (r *FirmwareUpdateHPEReconciler) transitionFailed(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, message string) error {
+	ctrl.LoggerFrom(ctx).Info("FirmwareUpdateHPE transitioning to Failed", "reason", message)
 	condition, err := utils.GetCondition(r.Conditions, fw.Status.Conditions, constants.ConditionVersionUpgradeIssued)
 	if err != nil {
 		return err

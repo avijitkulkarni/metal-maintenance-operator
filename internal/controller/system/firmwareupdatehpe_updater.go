@@ -74,8 +74,11 @@ type hpeRepositoryUpdater interface {
 	// username and password are the HTTP credentials for the SPP server (resolved from SecretRef by the caller).
 	GetSPPManifest(ctx context.Context, baseURI, username, password string) ([]SPPManifestEntry, error)
 
-	// AddFromUri instructs iLO to fetch the package at packageURI into its ComponentRepository.
-	// Returns the actual Filename as stored by iLO in the ComponentRepository.
+	// AddFromUri instructs iLO to fetch the package at packageURI.
+	// For firmware staged in ComponentRepository (iLO, NIC, storage…), returns the actual
+	// Filename as stored by iLO so the caller can include an ApplyUpdate entry in an InstallSet.
+	// For firmware staged directly (System ROM / BIOS), returns "" — the caller should trigger
+	// a server reboot without an ApplyUpdate entry; the pending update applies during POST.
 	AddFromUri(ctx context.Context, packageURI string) (string, error)
 
 	// CreateInstallSet creates a new InstallSet in iLO containing one ApplyUpdate entry per component
