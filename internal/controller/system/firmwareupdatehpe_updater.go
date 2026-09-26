@@ -28,6 +28,10 @@ type SPPManifestEntry struct {
 	// TargetGUIDs are the hardware identities this package targets; at least one must match an
 	// HPEFirmwareEntry.Targets entry to be considered applicable to the server.
 	TargetGUIDs []string
+	// DeviceClass is the HPE device class GUID from the SPP manifest version entry.
+	// Matches Oem.Hpe.DeviceClass in iLO FirmwareInventory for reliable component identification.
+	// Preferred over TargetGUIDs for matching because many components share a broadcast TargetGUID.
+	DeviceClass string
 	// Version is the firmware version provided by this package.
 	Version string
 	// Name is the human-readable component name from the manifest.

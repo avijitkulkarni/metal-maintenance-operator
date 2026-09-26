@@ -264,6 +264,7 @@ func (c *iloClient) GetSPPManifest(ctx context.Context, baseURI, username, passw
 				}
 				result = append(result, SPPManifestEntry{
 					TargetGUIDs:   f.TargetGUIDs,
+					DeviceClass:   ver.DeviceClass,
 					Version:       f.Version,
 					Name:          displayName,
 					PackagePath:   f.Name,

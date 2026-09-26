@@ -444,10 +444,14 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		return nil, fmt.Errorf("failed to fetch iLO FirmwareInventory: %w", err)
 	}
 
-	installedVersions := make(map[string]string)
+	installedVersions := make(map[string]string)      // target GUID → version
+	installedVersionsByClass := make(map[string]string) // DeviceClass → version
 	for _, e := range inventory {
 		for _, guid := range e.Targets {
 			installedVersions[guid] = e.Version
+		}
+		if e.DeviceClass != "" {
+			installedVersionsByClass[e.DeviceClass] = e.Version
 		}
 	}
 
@@ -460,11 +464,21 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		}
 		var currentVersion string
 		var found bool
-		for _, guid := range pkg.TargetGUIDs {
-			if v, ok := installedVersions[guid]; ok {
+		// DeviceClass uniquely identifies a component type; prefer it over TargetGUIDs which
+		// are frequently shared as a broadcast GUID across many unrelated components.
+		if pkg.DeviceClass != "" {
+			if v, ok := installedVersionsByClass[pkg.DeviceClass]; ok {
 				currentVersion = v
 				found = true
-				break
+			}
+		}
+		if !found {
+			for _, guid := range pkg.TargetGUIDs {
+				if v, ok := installedVersions[guid]; ok {
+					currentVersion = v
+					found = true
+					break
+				}
 			}
 		}
 		if !found {
@@ -472,7 +486,6 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		}
 		normalCurrent := normalizeVersion(currentVersion)
 		normalTarget := normalizeVersion(pkg.Version)
-		ctrl.LoggerFrom(ctx).Info("version compare", "pkg", pkg.Name, "currentVersion", currentVersion, "pkgVersion", pkg.Version, "normalCurrent", normalCurrent, "normalTarget", normalTarget)
 		if normalCurrent == normalTarget {
 			continue
 		}
@@ -516,10 +529,22 @@ func isDowngrade(current, candidate string) bool {
 }
 
 // normalizeVersion converts an HPE version string to a canonical form for comparison.
-// HPE FirmwareInventory returns versions like "v3.66 (04/01/2026)" while the SPP manifest
-// uses "3.66_04-01-2026". Both are normalized to "3.66_04_01_2026".
+// Handles formats such as:
+//   - FirmwareInventory: "U34 v3.66 (04/01/2026)" → "3.66_04_01_2026"
+//   - SPP manifest:      "3.66_04-01-2026"        → "3.66_04_01_2026"
 func normalizeVersion(v string) string {
 	v = strings.TrimSpace(v)
+	// Strip a leading model prefix like "U34 " (uppercase letter + pure digits + space).
+	// HPE FirmwareInventory includes the platform code before the version, e.g. "U34 v3.66 (04/01/2026)".
+	if len(v) >= 2 && v[0] >= 'A' && v[0] <= 'Z' {
+		end := 1
+		for end < len(v) && v[end] >= '0' && v[end] <= '9' {
+			end++
+		}
+		if end > 1 && end < len(v) && v[end] == ' ' {
+			v = v[end+1:]
+		}
+	}
 	v = strings.TrimPrefix(strings.TrimPrefix(v, "V"), "v")
 	var b strings.Builder
 	for _, r := range v {
