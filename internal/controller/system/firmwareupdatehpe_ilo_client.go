@@ -586,3 +586,30 @@ func (c *iloClient) DeleteInstallSet(ctx context.Context, installSetURI string) 
 	}
 	return nil
 }
+
+// ResetSystem triggers an immediate system reset via the Redfish ComputerSystem.Reset action.
+// Tries GracefulRestart first (suitable when the server is powered on); if that fails
+// (e.g. server is powered off), falls back to ResetType "On".
+func (c *iloClient) ResetSystem(ctx context.Context) error {
+	const resetPath = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+	resp, err := c.post(ctx, resetPath, map[string]string{"ResetType": "GracefulRestart"})
+	if err == nil {
+		resp.Body.Close()
+		return nil
+	}
+	// GracefulRestart may fail when the server is already off; try powering it on instead.
+	resp2, err2 := c.post(ctx, resetPath, map[string]string{"ResetType": "On"})
+	if err2 == nil {
+		resp2.Body.Close()
+		return nil
+	}
+	return fmt.Errorf("ResetSystem: GracefulRestart failed (%v); On fallback also failed (%v)", err, err2)
+}
+
+// DeleteTask removes the task at taskURI from iLO's UpdateTaskQueue.
+func (c *iloClient) DeleteTask(ctx context.Context, taskURI string) error {
+	if err := c.delete(ctx, taskURI); err != nil {
+		return fmt.Errorf("DeleteTask %s: %w", taskURI, err)
+	}
+	return nil
+}

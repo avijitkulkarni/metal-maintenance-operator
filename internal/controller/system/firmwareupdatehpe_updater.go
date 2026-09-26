@@ -98,6 +98,17 @@ type hpeRepositoryUpdater interface {
 
 	// DeleteInstallSet removes the InstallSet at installSetURI from iLO. Called on cleanup/deletion.
 	DeleteInstallSet(ctx context.Context, installSetURI string) error
+
+	// ResetSystem triggers an immediate system reset via Redfish ComputerSystem.Reset.
+	// Used when an InstallSet's ResetServer task is stuck Pending because iLO did not auto-trigger it
+	// (this happens when the InstallSet contains only direct-apply firmware with no ApplyUpdate entries).
+	// Tries GracefulRestart first; falls back to On when the server is powered off.
+	ResetSystem(ctx context.Context) error
+
+	// DeleteTask removes the task at taskURI from iLO's UpdateTaskQueue.
+	// Used to clear a stuck ResetServer task after the controller has driven a direct system reset,
+	// so the next reconcile sees an empty queue and proceeds to convergence.
+	DeleteTask(ctx context.Context, taskURI string) error
 }
 
 // newHPERepositoryUpdater returns a real hpeRepositoryUpdater backed by the HPE iLO Redfish API.

@@ -632,6 +632,25 @@ func (r *FirmwareUpdateHPEReconciler) processInProgressState(ctx context.Context
 		return false, r.transitionFailed(ctx, fw, msg)
 	}
 
+	// When the only non-terminal tasks are ResetServer entries, iLO will not auto-execute the reset
+	// if the InstallSet had no ApplyUpdate steps (e.g. all firmware was direct-apply / BIOS-type).
+	// Drive the power cycle directly via ComputerSystem.Reset and clear the stuck tasks so the
+	// next reconcile can call handleConvergence once the server has finished rebooting.
+	if onlyResetServerPending(tasks) {
+		log.Info("All firmware tasks complete; driving server reset directly via ComputerSystem.Reset")
+		for _, t := range tasks {
+			if t.State != "Completed" {
+				if delErr := updater.DeleteTask(ctx, t.URI); delErr != nil {
+					log.Error(delErr, "Failed to delete stuck ResetServer task; proceeding with reset anyway", "uri", t.URI)
+				}
+			}
+		}
+		if err := updater.ResetSystem(ctx); err != nil {
+			return false, fmt.Errorf("failed to reset system after direct-apply firmware staging: %w", err)
+		}
+		return true, nil // Requeue after ResyncInterval; server should have rebooted and applied firmware by then.
+	}
+
 	if summary.InProgress > 0 || (summary.Total > 0 && summary.Completed < summary.Total) {
 		log.V(1).Info("Install Set tasks still running", "total", summary.Total, "completed", summary.Completed, "inProgress", summary.InProgress)
 		return true, nil
@@ -663,6 +682,29 @@ func buildTaskStatus(tasks []HPETaskStatus) ([]systemv1alpha1.HPEUpdateTask, sys
 		}
 	}
 	return result, summary
+}
+
+// onlyResetServerPending reports whether all non-terminal tasks are named "ResetServer".
+// Returns false when the task list is empty, when any task has a failure state, or when any
+// non-terminal task is not a ResetServer — ensuring we only drive a direct reset when all
+// ApplyUpdate work is truly done and just the reboot step remains.
+func onlyResetServerPending(tasks []HPETaskStatus) bool {
+	hasResetServer := false
+	for _, t := range tasks {
+		switch t.State {
+		case "Completed":
+			// Already done — fine.
+		case "Exception", "Killed", "Cancelled":
+			// A failed task is present; let the failure handler deal with it.
+			return false
+		default: // Pending, InProgress, or any unrecognised state.
+			if t.Name != "ResetServer" {
+				return false
+			}
+			hasResetServer = true
+		}
+	}
+	return hasResetServer
 }
 
 // handleConvergence re-computes the firmware diff after an Install Set completes.
