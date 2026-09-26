@@ -472,6 +472,7 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		}
 		normalCurrent := normalizeVersion(currentVersion)
 		normalTarget := normalizeVersion(pkg.Version)
+		ctrl.LoggerFrom(ctx).Info("version compare", "pkg", pkg.Name, "currentVersion", currentVersion, "pkgVersion", pkg.Version, "normalCurrent", normalCurrent, "normalTarget", normalTarget)
 		if normalCurrent == normalTarget {
 			continue
 		}
