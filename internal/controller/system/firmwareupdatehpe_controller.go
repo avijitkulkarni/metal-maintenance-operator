@@ -6,6 +6,7 @@ package system
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ironcore-dev/controller-utils/clientutils"
@@ -469,10 +470,12 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		if !found {
 			continue
 		}
-		if currentVersion == pkg.Version {
+		normalCurrent := normalizeVersion(currentVersion)
+		normalTarget := normalizeVersion(pkg.Version)
+		if normalCurrent == normalTarget {
 			continue
 		}
-		if !applyDowngrade && isDowngrade(currentVersion, pkg.Version) {
+		if !applyDowngrade && isDowngrade(normalCurrent, normalTarget) {
 			continue
 		}
 		toUpdate = append(toUpdate, pkg)
@@ -509,6 +512,28 @@ func isOOBFlashable(pkg SPPManifestEntry) bool {
 // Currently uses lexicographic comparison which is only correct for simple dotted-numeric strings.
 func isDowngrade(current, candidate string) bool {
 	return candidate < current
+}
+
+// normalizeVersion converts an HPE version string to a canonical form for comparison.
+// HPE FirmwareInventory returns versions like "v3.66 (04/01/2026)" while the SPP manifest
+// uses "3.66_04-01-2026". Both are normalized to "3.66_04_01_2026".
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "V"), "v")
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case (r >= '0' && r <= '9') || r == '.':
+			b.WriteRune(r)
+		case r == '_' || r == '-' || r == '/' || r == ' ' || r == '(' || r == ')':
+			b.WriteRune('_')
+		}
+	}
+	result := b.String()
+	for strings.Contains(result, "__") {
+		result = strings.ReplaceAll(result, "__", "_")
+	}
+	return strings.Trim(result, "_")
 }
 
 // handleStaging calls AddFromUri for each component in the diff.
