@@ -483,6 +483,14 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 func (c *iloClient) CreateInstallSet(ctx context.Context, name string, componentFilenames []string) (string, error) {
 	const installSetsPath = "/redfish/v1/UpdateService/InstallSets"
 
+	// iLO rejects the create with Base.1.18.ResourceAlreadyExists when an InstallSet with the
+	// same Name already exists. A stale InstallSet is a common leftover from a previous aborted
+	// or reset-only run (the ResetServer fix clears the stuck task, not the InstallSet), so
+	// remove any existing InstallSet with this name first to keep CreateInstallSet idempotent.
+	if err := c.deleteInstallSetByName(ctx, name); err != nil {
+		return "", fmt.Errorf("CreateInstallSet %s: clearing pre-existing InstallSet: %w", name, err)
+	}
+
 	seq := make([]iloInstallSetSequenceEntry, 0, len(componentFilenames)+1)
 	for _, fn := range componentFilenames {
 		seq = append(seq, iloInstallSetSequenceEntry{
@@ -583,6 +591,33 @@ func (c *iloClient) fetchTaskQueue(ctx context.Context) ([]HPETaskStatus, error)
 func (c *iloClient) DeleteInstallSet(ctx context.Context, installSetURI string) error {
 	if err := c.delete(ctx, installSetURI); err != nil {
 		return fmt.Errorf("DeleteInstallSet %s: %w", installSetURI, err)
+	}
+	return nil
+}
+
+// deleteInstallSetByName removes any InstallSet in the collection whose Name matches.
+// It is a no-op when no matching InstallSet exists. Used by CreateInstallSet to clear a
+// stale InstallSet left by a prior aborted run, which would otherwise cause iLO to reject
+// the create with Base.1.18.ResourceAlreadyExists.
+func (c *iloClient) deleteInstallSetByName(ctx context.Context, name string) error {
+	const installSetsPath = "/redfish/v1/UpdateService/InstallSets"
+
+	var coll iloCollection
+	if err := c.get(ctx, installSetsPath, &coll); err != nil {
+		return fmt.Errorf("listing InstallSets: %w", err)
+	}
+	for _, m := range coll.Members {
+		var is struct {
+			Name string `json:"Name"`
+		}
+		if err := c.get(ctx, m.ODataID, &is); err != nil {
+			return fmt.Errorf("fetching InstallSet %s: %w", m.ODataID, err)
+		}
+		if is.Name == name {
+			if err := c.delete(ctx, m.ODataID); err != nil {
+				return fmt.Errorf("deleting existing InstallSet %s (%s): %w", name, m.ODataID, err)
+			}
+		}
 	}
 	return nil
 }

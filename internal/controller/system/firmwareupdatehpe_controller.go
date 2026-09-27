@@ -444,17 +444,6 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		return nil, fmt.Errorf("failed to fetch iLO FirmwareInventory: %w", err)
 	}
 
-	installedVersions := make(map[string]string)      // target GUID → version
-	installedVersionsByClass := make(map[string]string) // DeviceClass → version
-	for _, e := range inventory {
-		for _, guid := range e.Targets {
-			installedVersions[guid] = e.Version
-		}
-		if e.DeviceClass != "" {
-			installedVersionsByClass[e.DeviceClass] = e.Version
-		}
-	}
-
 	applyDowngrade := fw.Spec.ApplyDowngradeVersions != nil && *fw.Spec.ApplyDowngradeVersions
 
 	var toUpdate []SPPManifestEntry
@@ -462,25 +451,13 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		if !isOOBFlashable(pkg) {
 			continue
 		}
-		var currentVersion string
-		var found bool
-		// DeviceClass uniquely identifies a component type; prefer it over TargetGUIDs which
-		// are frequently shared as a broadcast GUID across many unrelated components.
-		if pkg.DeviceClass != "" {
-			if v, ok := installedVersionsByClass[pkg.DeviceClass]; ok {
-				currentVersion = v
-				found = true
-			}
-		}
-		if !found {
-			for _, guid := range pkg.TargetGUIDs {
-				if v, ok := installedVersions[guid]; ok {
-					currentVersion = v
-					found = true
-					break
-				}
-			}
-		}
+		// A package applies to this server only if an installed component shares at least one
+		// target GUID with it (the same identity iLO validates against). The shared GUID pins the
+		// exact model: the SPP repo carries many System ROM packages (U30/U31/U34/U64…) that all
+		// share DeviceClass aa148d2e, but only the U34 package carries this board's target GUID,
+		// so only it matches. Matching on DeviceClass alone paired every System ROM model to this
+		// board and staged firmware iLO rejects with "No matching target found".
+		currentVersion, found := matchInstalledVersion(pkg, inventory)
 		if !found {
 			continue
 		}
@@ -492,6 +469,9 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 		if !applyDowngrade && isDowngrade(normalCurrent, normalTarget) {
 			continue
 		}
+		ctrl.LoggerFrom(ctx).Info("firmware update selected",
+			"package", pkg.PackagePath, "deviceClass", pkg.DeviceClass,
+			"currentVersion", currentVersion, "packageVersion", pkg.Version)
 		toUpdate = append(toUpdate, pkg)
 	}
 
@@ -506,6 +486,32 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 	}
 
 	return toUpdate, nil
+}
+
+// matchInstalledVersion finds the installed component a manifest package applies to and returns
+// its current firmware version. A package matches an installed component only when they share at
+// least one target GUID AND — when both declare a DeviceClass — the DeviceClass agrees.
+//
+// Requiring a shared target GUID (the same identity iLO validates against) ensures we never select
+// firmware for a different model of the same device class: the SPP repo carries many System ROM
+// packages (U30/U31/U34/U64…) that all share DeviceClass aa148d2e, but only the package carrying
+// this board's target GUID matches. The DeviceClass check disambiguates components that share a
+// family/broadcast GUID such as …020c (System ROM and Intelligent Platform Abstraction Data both
+// carry it but differ by DeviceClass).
+func matchInstalledVersion(pkg SPPManifestEntry, inventory []HPEFirmwareEntry) (string, bool) {
+	for _, e := range inventory {
+		if pkg.DeviceClass != "" && e.DeviceClass != "" && pkg.DeviceClass != e.DeviceClass {
+			continue
+		}
+		for _, pg := range pkg.TargetGUIDs {
+			for _, eg := range e.Targets {
+				if pg == eg {
+					return e.Version, true
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 // isOOBFlashable reports whether a component can be flashed out-of-band via iLO.
