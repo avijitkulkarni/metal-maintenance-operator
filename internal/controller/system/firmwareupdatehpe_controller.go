@@ -265,6 +265,12 @@ func (r *FirmwareUpdateHPEReconciler) processPendingState(ctx context.Context, f
 	}
 
 	// Step 4: stage each .fwpkg into iLO's ComponentRepository via AddFromUri.
+	// Device firmware (e.g. NIC) requires the host powered on to stage; the ServerMaintenance park
+	// leaves it off, so power it on first. iLO otherwise rejects AddFromUri with
+	// "this update requires system power ON". No-op when already on.
+	if err := updater.EnsurePoweredOn(ctx); err != nil {
+		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to power on server before staging: %v", err))
+	}
 	filenames, err := r.handleStaging(ctx, fw, components, updater)
 	if err != nil {
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to stage firmware packages: %v", err))

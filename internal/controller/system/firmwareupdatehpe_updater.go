@@ -109,6 +109,12 @@ type hpeRepositoryUpdater interface {
 	// Used to clear a stuck ResetServer task after the controller has driven a direct system reset,
 	// so the next reconcile sees an empty queue and proceeds to convergence.
 	DeleteTask(ctx context.Context, taskURI string) error
+
+	// EnsurePoweredOn powers the host on (and waits until it reports On) before firmware staging.
+	// Device firmware (e.g. NIC) cannot be staged via AddFromUri while the host is off — iLO rejects
+	// it with "this update requires system power ON" — but the ServerMaintenance park leaves the
+	// server powered off. No-op when the server is already on.
+	EnsurePoweredOn(ctx context.Context) error
 }
 
 // newHPERepositoryUpdater returns a real hpeRepositoryUpdater backed by the HPE iLO Redfish API.

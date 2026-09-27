@@ -648,3 +648,51 @@ func (c *iloClient) DeleteTask(ctx context.Context, taskURI string) error {
 	}
 	return nil
 }
+
+// getPowerState returns the host PowerState ("On", "Off", …) from the ComputerSystem resource.
+func (c *iloClient) getPowerState(ctx context.Context) (string, error) {
+	var sys struct {
+		PowerState string `json:"PowerState"`
+	}
+	if err := c.get(ctx, "/redfish/v1/Systems/1", &sys); err != nil {
+		return "", fmt.Errorf("reading PowerState: %w", err)
+	}
+	return sys.PowerState, nil
+}
+
+// EnsurePoweredOn makes sure the host is powered on before firmware staging.
+// Device firmware (e.g. NIC pldm packages) cannot be staged via AddFromUri while the host is off —
+// iLO rejects it with "this update requires system power ON". The ServerMaintenance park leaves the
+// server powered off, so this powers it on (ResetType "On") and waits until PowerState reports "On".
+// It is a no-op when the server is already on.
+func (c *iloClient) EnsurePoweredOn(ctx context.Context) error {
+	const resetPath = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+
+	state, err := c.getPowerState(ctx)
+	if err != nil {
+		return err
+	}
+	if state == "On" {
+		return nil
+	}
+
+	resp, err := c.post(ctx, resetPath, map[string]string{"ResetType": "On"})
+	if err != nil {
+		return fmt.Errorf("EnsurePoweredOn: powering on: %w", err)
+	}
+	resp.Body.Close()
+
+	// Wait for the host to report On (up to 30 × 10s = 5 min).
+	for attempt := 0; attempt < 30; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+		state, err := c.getPowerState(ctx)
+		if err == nil && state == "On" {
+			return nil
+		}
+	}
+	return fmt.Errorf("EnsurePoweredOn: timed out waiting for host to power on")
+}
