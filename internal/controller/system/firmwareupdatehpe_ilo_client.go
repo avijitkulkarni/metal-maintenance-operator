@@ -32,9 +32,10 @@ type iloCollection struct {
 }
 
 type iloFirmwareEntry struct {
-	Name    string `json:"Name"`
-	Version string `json:"Version"`
-	Oem     struct {
+	Name       string `json:"Name"`
+	Version    string `json:"Version"`
+	Updateable bool   `json:"Updateable"`
+	Oem        struct {
 		Hpe struct {
 			DeviceClass string   `json:"DeviceClass"`
 			Targets     []string `json:"Targets"`
@@ -206,6 +207,7 @@ func (c *iloClient) GetFirmwareInventory(ctx context.Context) ([]HPEFirmwareEntr
 			DeviceClass: entry.Oem.Hpe.DeviceClass,
 			Version:     entry.Version,
 			Name:        entry.Name,
+			Updateable:  entry.Updateable,
 		})
 	}
 	return entries, nil

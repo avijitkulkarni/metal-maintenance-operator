@@ -21,6 +21,11 @@ type HPEFirmwareEntry struct {
 	Version string
 	// Name is the human-readable component name (e.g. "System ROM", "iLO 5").
 	Name string
+	// Updateable reflects the Redfish SoftwareInventory "Updateable" flag — whether iLO can update
+	// this component out-of-band. Components with Updateable=false (e.g. NS204i boot controllers,
+	// which update via an OS/Smart Storage agent rather than iLO Redfish) must be excluded from the
+	// diff: iLO rejects staging them with "No matching target found" / "Invalid file or firmware image".
+	Updateable bool
 }
 
 // SPPManifestEntry represents a single firmware package entry from the SPP manifest/metadata.json.

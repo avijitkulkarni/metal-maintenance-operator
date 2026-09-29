@@ -506,6 +506,13 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 // carry it but differ by DeviceClass).
 func matchInstalledVersion(pkg SPPManifestEntry, inventory []HPEFirmwareEntry) (string, bool) {
 	for _, e := range inventory {
+		// Skip components iLO reports as not updateable out-of-band (Updateable=false), e.g. the
+		// NS204i boot controller, which updates via an OS agent. Selecting them makes iLO reject the
+		// staging with "No matching target found" / "Invalid file or firmware image" and (because the
+		// rejected upload holds iLO's single upload slot) blocks the remaining components too.
+		if !e.Updateable {
+			continue
+		}
 		if pkg.DeviceClass != "" && e.DeviceClass != "" && pkg.DeviceClass != e.DeviceClass {
 			continue
 		}
