@@ -255,6 +255,10 @@ func (r *FirmwareUpdateHPEReconciler) processPendingState(ctx context.Context, f
 	// Step 3: compute firmware diff (SPP manifest vs FirmwareInventory).
 	components, err := r.handleDiff(ctx, fw, updater, username, password)
 	if err != nil {
+		if isTransientILOError(err) {
+			// iLO/host likely resetting; requeue with backoff rather than failing the run.
+			return false, err
+		}
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to compute firmware diff: %v", err))
 	}
 	if len(components) == 0 {
@@ -265,15 +269,21 @@ func (r *FirmwareUpdateHPEReconciler) processPendingState(ctx context.Context, f
 	}
 
 	// Step 4: stage each .fwpkg into iLO's ComponentRepository via AddFromUri.
-	// Device firmware (e.g. NIC) requires the host powered on to stage; the ServerMaintenance park
-	// leaves it off, so power it on first. iLO otherwise rejects AddFromUri with
-	// "this update requires system power ON". No-op when already on.
+	// Device firmware (e.g. NIC, NS204i) is only enumerable as a flash target once the host has
+	// powered on AND finished POST; EnsurePoweredOn powers it on and waits for FinishedPost (the
+	// ServerMaintenance park leaves it off and re-asserts the park, so this re-asserts power).
+	// handleStaging also re-ensures this before each component.
 	if err := updater.EnsurePoweredOn(ctx); err != nil {
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to power on server before staging: %v", err))
 	}
-	filenames, err := r.handleStaging(ctx, fw, components, updater)
+	filenames, skipped, err := r.handleStaging(ctx, fw, components, updater)
 	if err != nil {
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to stage firmware packages: %v", err))
+	}
+	if len(skipped) > 0 {
+		if err := r.recordSkippedComponents(ctx, fw, skipped); err != nil {
+			return false, err
+		}
 	}
 
 	// Step 5: create an InstallSet and invoke it.
@@ -506,13 +516,6 @@ func (r *FirmwareUpdateHPEReconciler) handleDiff(ctx context.Context, fw *system
 // carry it but differ by DeviceClass).
 func matchInstalledVersion(pkg SPPManifestEntry, inventory []HPEFirmwareEntry) (string, bool) {
 	for _, e := range inventory {
-		// Skip components iLO reports as not updateable out-of-band (Updateable=false), e.g. the
-		// NS204i boot controller, which updates via an OS agent. Selecting them makes iLO reject the
-		// staging with "No matching target found" / "Invalid file or firmware image" and (because the
-		// rejected upload holds iLO's single upload slot) blocks the remaining components too.
-		if !e.Updateable {
-			continue
-		}
 		if pkg.DeviceClass != "" && e.DeviceClass != "" && pkg.DeviceClass != e.DeviceClass {
 			continue
 		}
@@ -538,6 +541,40 @@ func isOOBFlashable(pkg SPPManifestEntry) bool {
 		}
 	}
 	return false
+}
+
+// isTransientILOError reports whether an error from an iLO call is a transient condition during the
+// host/iLO reset+POST window (inventory URIs briefly 404, or the connection drops) rather than a
+// permanent failure. Transient errors should requeue with backoff instead of transitioning to Failed.
+func isTransientILOError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"ResourceMissingAtURI",
+		"404",
+		"connection refused",
+		"connection reset",
+		"EOF",
+		"i/o timeout",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordSkippedComponents persists components that were skipped during staging (iLO rejected them)
+// into status so a partial run is visible to the operator.
+func (r *FirmwareUpdateHPEReconciler) recordSkippedComponents(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, skipped []string) error {
+	fwBase := fw.DeepCopy()
+	fw.Status.SkippedComponents = skipped
+	if err := r.Status().Patch(ctx, fw, client.MergeFrom(fwBase)); err != nil {
+		return fmt.Errorf("failed to record skipped components: %w", err)
+	}
+	return nil
 }
 
 // isDowngrade reports whether candidate is an older version than current.
@@ -589,13 +626,31 @@ func normalizeVersion(v string) string {
 // For firmware applied directly by iLO without ComponentRepository staging (System ROM / BIOS),
 // AddFromUri returns "". These are omitted from the returned list; they are already pending
 // application on the next server reboot and do not need an ApplyUpdate step.
-func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, components []SPPManifestEntry, updater hpeRepositoryUpdater) ([]string, error) {
-	filenames := make([]string, 0, len(components))
+//
+// Resilience: before each component it (re-)ensures the host is powered on and past POST — the
+// ServerMaintenance park can re-power-off the host between components, and a device is only
+// enumerable as a flash target after POST. If iLO rejects a specific package (wrong target / bad
+// image), that component is skipped and recorded (returned in skipped) so the remaining components
+// still proceed; the rejected upload releases iLO's single upload slot. Other errors (transport,
+// slot-busy, ctx) abort staging.
+func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, components []SPPManifestEntry, updater hpeRepositoryUpdater) (filenames []string, skipped []string, err error) {
+	log := ctrl.LoggerFrom(ctx)
+	filenames = make([]string, 0, len(components))
 	for _, pkg := range components {
+		// Re-assert power + POST before each component (no-op when already On + FinishedPost).
+		if err := updater.EnsurePoweredOn(ctx); err != nil {
+			return nil, skipped, fmt.Errorf("failed to ensure host powered on before staging %s: %w", pkg.Name, err)
+		}
 		packageURI := fw.Spec.Repository.BaseURI + "/" + pkg.PackagePath
 		filename, err := updater.AddFromUri(ctx, packageURI)
 		if err != nil {
-			return nil, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
+			if isComponentStagingRejection(err) {
+				log.Info("iLO rejected component during staging; skipping and continuing",
+					"component", pkg.Name, "package", pkg.PackagePath, "error", err)
+				skipped = append(skipped, fmt.Sprintf("%s (%s): %v", pkg.Name, pkg.PackagePath, err))
+				continue
+			}
+			return nil, skipped, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
 		}
 		if filename != "" {
 			// Firmware staged in ComponentRepository — include in InstallSet ApplyUpdate.
@@ -603,7 +658,20 @@ func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *sys
 		}
 		// filename == "": firmware staged directly (BIOS/System ROM); server reboot applies it.
 	}
-	return filenames, nil
+	return filenames, skipped, nil
+}
+
+// isComponentStagingRejection reports whether an AddFromUri error is iLO rejecting this specific
+// package (wrong target model, or an image it cannot flash out-of-band) rather than a transport or
+// upload-slot error. These are safe to skip per-component: the rejected upload releases iLO's single
+// upload slot, so the remaining components can still proceed.
+func isComponentStagingRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "No matching target found") ||
+		strings.Contains(msg, "Invalid file or firmware image")
 }
 
 // handleInstallSet creates an InstallSet in iLO for all staged components, invokes it, and writes
@@ -742,6 +810,10 @@ func (r *FirmwareUpdateHPEReconciler) handleConvergence(ctx context.Context, fw 
 
 	components, err := r.handleDiff(ctx, fw, updater, username, password)
 	if err != nil {
+		if isTransientILOError(err) {
+			// iLO/host still resetting after the flash; requeue with backoff rather than failing.
+			return false, err
+		}
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("convergence diff failed: %v", err))
 	}
 

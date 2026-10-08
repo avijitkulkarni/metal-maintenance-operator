@@ -32,10 +32,9 @@ type iloCollection struct {
 }
 
 type iloFirmwareEntry struct {
-	Name       string `json:"Name"`
-	Version    string `json:"Version"`
-	Updateable bool   `json:"Updateable"`
-	Oem        struct {
+	Name    string `json:"Name"`
+	Version string `json:"Version"`
+	Oem     struct {
 		Hpe struct {
 			DeviceClass string   `json:"DeviceClass"`
 			Targets     []string `json:"Targets"`
@@ -81,12 +80,12 @@ type sppProduct struct {
 }
 
 type sppVersion struct {
-	DeviceClass   string      `json:"DeviceClass"`
-	Devices       sppDevices  `json:"Devices"`
-	Package       sppPackage  `json:"Package"`
-	PackageFormat string      `json:"PackageFormat"`
-	UpdatableBy   []string    `json:"UpdatableBy"`
-	VersionID     string      `json:"VersionId"`
+	DeviceClass   string     `json:"DeviceClass"`
+	Devices       sppDevices `json:"Devices"`
+	Package       sppPackage `json:"Package"`
+	PackageFormat string     `json:"PackageFormat"`
+	UpdatableBy   []string   `json:"UpdatableBy"`
+	VersionID     string     `json:"VersionId"`
 }
 
 type sppDevices struct {
@@ -207,7 +206,6 @@ func (c *iloClient) GetFirmwareInventory(ctx context.Context) ([]HPEFirmwareEntr
 			DeviceClass: entry.Oem.Hpe.DeviceClass,
 			Version:     entry.Version,
 			Name:        entry.Name,
-			Updateable:  entry.Updateable,
 		})
 	}
 	return entries, nil
@@ -651,50 +649,60 @@ func (c *iloClient) DeleteTask(ctx context.Context, taskURI string) error {
 	return nil
 }
 
-// getPowerState returns the host PowerState ("On", "Off", …) from the ComputerSystem resource.
-func (c *iloClient) getPowerState(ctx context.Context) (string, error) {
+// getSystemState returns the host PowerState ("On", "Off", …) and the HPE Oem PostState
+// ("InPost", "FinishedPost", …) from the ComputerSystem resource in a single GET.
+func (c *iloClient) getSystemState(ctx context.Context) (power, post string, err error) {
 	var sys struct {
 		PowerState string `json:"PowerState"`
+		Oem        struct {
+			Hpe struct {
+				PostState string `json:"PostState"`
+			} `json:"Hpe"`
+		} `json:"Oem"`
 	}
 	if err := c.get(ctx, "/redfish/v1/Systems/1", &sys); err != nil {
-		return "", fmt.Errorf("reading PowerState: %w", err)
+		return "", "", fmt.Errorf("reading system power/post state: %w", err)
 	}
-	return sys.PowerState, nil
+	return sys.PowerState, sys.Oem.Hpe.PostState, nil
 }
 
-// EnsurePoweredOn makes sure the host is powered on before firmware staging.
-// Device firmware (e.g. NIC pldm packages) cannot be staged via AddFromUri while the host is off —
-// iLO rejects it with "this update requires system power ON". The ServerMaintenance park leaves the
-// server powered off, so this powers it on (ResetType "On") and waits until PowerState reports "On".
-// It is a no-op when the server is already on.
+// EnsurePoweredOn makes sure the host is powered on AND has finished UEFI POST before firmware staging.
+//
+// Waiting for PowerState=="On" is not sufficient: device firmware (NIC, NS204i, …) is only enumerated
+// as a flash target once POST completes. Staging via AddFromUri before then makes iLO reject the
+// package with "No matching target found", and the rejected ~11-min upload holds iLO's single upload
+// slot, blocking every following component. So we additionally wait for Oem.Hpe.PostState=="FinishedPost".
+//
+// The ServerMaintenance park powers the host off, and metal-operator re-asserts the park whenever the
+// server drifts out of Parked — so a single power-on can be overridden mid-wait (a power tug-of-war).
+// This loop therefore re-issues the power-on whenever it observes the host back Off/PoweringOff.
+//
+// It is a no-op when the host is already On and past POST.
 func (c *iloClient) EnsurePoweredOn(ctx context.Context) error {
 	const resetPath = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+	const finishedPost = "FinishedPost"
 
-	state, err := c.getPowerState(ctx)
-	if err != nil {
-		return err
-	}
-	if state == "On" {
-		return nil
-	}
-
-	resp, err := c.post(ctx, resetPath, map[string]string{"ResetType": "On"})
-	if err != nil {
-		return fmt.Errorf("EnsurePoweredOn: powering on: %w", err)
-	}
-	resp.Body.Close()
-
-	// Wait for the host to report On (up to 30 × 10s = 5 min).
-	for attempt := 0; attempt < 30; attempt++ {
+	// Wait up to 60 × 10s = 10 min for On + FinishedPost (covers a cold power-on through full POST),
+	// re-asserting power whenever the park powers the host back off.
+	for attempt := 0; attempt < 60; attempt++ {
+		power, post, err := c.getSystemState(ctx)
+		if err == nil {
+			if power == "On" && post == finishedPost {
+				return nil
+			}
+			// Re-assert power only when the host is not already progressing toward On; issuing
+			// ResetType "On" while it is already On and POSTing is unnecessary.
+			if power == "Off" || power == "PoweringOff" || power == "" {
+				if resp, perr := c.post(ctx, resetPath, map[string]string{"ResetType": "On"}); perr == nil {
+					resp.Body.Close()
+				}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(10 * time.Second):
 		}
-		state, err := c.getPowerState(ctx)
-		if err == nil && state == "On" {
-			return nil
-		}
 	}
-	return fmt.Errorf("EnsurePoweredOn: timed out waiting for host to power on")
+	return fmt.Errorf("EnsurePoweredOn: timed out waiting for host to power on and finish POST")
 }

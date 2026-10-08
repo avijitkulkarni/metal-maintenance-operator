@@ -604,6 +604,11 @@ func (in *FirmwareUpdateHPEStatus) DeepCopyInto(out *FirmwareUpdateHPEStatus) {
 		*out = new(HPEUpdateTasksSummary)
 		**out = **in
 	}
+	if in.SkippedComponents != nil {
+		in, out := &in.SkippedComponents, &out.SkippedComponents
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

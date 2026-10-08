@@ -160,6 +160,12 @@ type FirmwareUpdateHPEStatus struct {
 	// +optional
 	FailedAttempts int32 `json:"failedAttempts,omitempty"`
 
+	// SkippedComponents lists components iLO rejected during staging (e.g. wrong target model or an
+	// image it cannot flash out-of-band) that were skipped so the remaining components could still
+	// proceed. A non-empty list indicates a partial run.
+	// +optional
+	SkippedComponents []string `json:"skippedComponents,omitempty"`
+
 	// ObservedGeneration is the most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
