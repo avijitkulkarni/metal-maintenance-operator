@@ -406,11 +406,23 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 	for attempt := 0; attempt < 10; attempt++ {
 		resp, err := c.post(ctx, actionPath, body)
 		if err != nil {
-			if strings.Contains(err.Error(), "ComponentUploadAlreadyInProgress") {
+			errStr := err.Error()
+			if strings.Contains(errStr, "ComponentUploadAlreadyInProgress") {
+				// iLO upload slot is busy; wait for the current upload to finish.
 				select {
 				case <-ctx.Done():
 					return "", ctx.Err()
 				case <-time.After(30 * time.Second):
+					continue
+				}
+			}
+			if strings.Contains(errStr, "FirmwareFlashAlreadyInProgress") {
+				// iLO is actively flashing a component right now; a flash can take several
+				// minutes, so wait longer before retrying.
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(60 * time.Second):
 					continue
 				}
 			}
