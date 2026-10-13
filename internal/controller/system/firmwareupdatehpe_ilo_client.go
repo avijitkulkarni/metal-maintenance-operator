@@ -718,3 +718,22 @@ func (c *iloClient) EnsurePoweredOn(ctx context.Context) error {
 	}
 	return fmt.Errorf("EnsurePoweredOn: timed out waiting for host to power on and finish POST")
 }
+
+// WaitForILOOnline polls the Redfish root resource until iLO responds, tolerating the
+// connection drop that occurs while iLO is rebooting after a self-firmware-update.
+// Returns nil once iLO is reachable again.
+func (c *iloClient) WaitForILOOnline(ctx context.Context) error {
+	const maxAttempts = 60 // 60 × 10s = 10 min
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var root struct{}
+		if err := c.get(ctx, "/redfish/v1/", &root); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+	return fmt.Errorf("WaitForILOOnline: timed out after %d attempts waiting for iLO to come back online", maxAttempts)
+}

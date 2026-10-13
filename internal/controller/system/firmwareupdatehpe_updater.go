@@ -115,6 +115,10 @@ type hpeRepositoryUpdater interface {
 	// it with "this update requires system power ON" — but the ServerMaintenance park leaves the
 	// server powered off. No-op when the server is already on.
 	EnsurePoweredOn(ctx context.Context) error
+
+	// WaitForILOOnline polls the Redfish root resource until iLO responds. Used after flashing
+	// iLO firmware to wait for the BMC to come back online before proceeding with other components.
+	WaitForILOOnline(ctx context.Context) error
 }
 
 // newHPERepositoryUpdater returns a real hpeRepositoryUpdater backed by the HPE iLO Redfish API.

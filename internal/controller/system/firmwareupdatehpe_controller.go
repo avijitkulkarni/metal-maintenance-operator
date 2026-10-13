@@ -276,7 +276,7 @@ func (r *FirmwareUpdateHPEReconciler) processPendingState(ctx context.Context, f
 	if err := updater.EnsurePoweredOn(ctx); err != nil {
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to power on server before staging: %v", err))
 	}
-	filenames, skipped, err := r.handleStaging(ctx, fw, components, updater)
+	filenames, skipped, hasDirectApply, err := r.handleStaging(ctx, fw, components, updater)
 	if err != nil {
 		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to stage firmware packages: %v", err))
 	}
@@ -286,9 +286,14 @@ func (r *FirmwareUpdateHPEReconciler) processPendingState(ctx context.Context, f
 		}
 	}
 
-	// Step 5: create an InstallSet and invoke it.
-	if err := r.handleInstallSet(ctx, fw, filenames, updater); err != nil {
-		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to create/invoke Install Set: %v", err))
+	// Step 5: create and invoke an InstallSet only when there are ComponentRepository components
+	// to flash or direct-apply components (System ROM) that need a server reboot to take effect.
+	// If iLO was the only component (no filenames, no direct-apply), it already self-applied and
+	// rebooted the BMC — no server reboot is needed. processInProgressState handles the empty-URI case.
+	if len(filenames) > 0 || hasDirectApply {
+		if err := r.handleInstallSet(ctx, fw, filenames, updater); err != nil {
+			return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to create/invoke Install Set: %v", err))
+		}
 	}
 
 	// Transition to InProgress — the server is now rebooting under iLO's control.
@@ -620,26 +625,41 @@ func normalizeVersion(v string) string {
 
 // handleStaging calls AddFromUri for each component in the diff.
 //
-// For firmware that iLO stages in ComponentRepository (iLO, NIC, storage…), AddFromUri
-// returns the actual Filename; these are collected for use in CreateInstallSet ApplyUpdate entries.
+// iLO firmware is handled specially: it is staged LAST so that the actual component flashing
+// (via the InstallSet) happens with the new iLO version already running. AddFromUri for the iLO
+// package causes iLO to self-flash and reboot the BMC immediately; WaitForILOOnline blocks until
+// iLO is back online. iLO is NOT added to the InstallSet filenames — it self-applies during staging.
+//
+// For firmware that iLO stages in ComponentRepository (NIC, storage…), AddFromUri returns the actual
+// Filename; these are collected for use in CreateInstallSet ApplyUpdate entries.
 //
 // For firmware applied directly by iLO without ComponentRepository staging (System ROM / BIOS),
 // AddFromUri returns "". These are omitted from the returned list; they are already pending
-// application on the next server reboot and do not need an ApplyUpdate step.
+// application on the next server reboot and do not need an ApplyUpdate step. hasDirectApply is
+// set true so the caller knows a server reboot is still needed.
 //
-// Resilience: before each component it (re-)ensures the host is powered on and past POST — the
-// ServerMaintenance park can re-power-off the host between components, and a device is only
-// enumerable as a flash target after POST. If iLO rejects a specific package (wrong target / bad
-// image), that component is skipped and recorded (returned in skipped) so the remaining components
-// still proceed; the rejected upload releases iLO's single upload slot. Other errors (transport,
-// slot-busy, ctx) abort staging.
-func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, components []SPPManifestEntry, updater hpeRepositoryUpdater) (filenames []string, skipped []string, err error) {
+// Resilience: before each non-iLO component it (re-)ensures the host is powered on and past POST.
+// If iLO rejects a specific package, that component is skipped and recorded (returned in skipped).
+func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, components []SPPManifestEntry, updater hpeRepositoryUpdater) (filenames []string, skipped []string, hasDirectApply bool, err error) {
 	log := ctrl.LoggerFrom(ctx)
 	filenames = make([]string, 0, len(components))
-	for _, pkg := range components {
-		// Re-assert power + POST before each component (no-op when already On + FinishedPost).
+
+	// Separate iLO from all other components so iLO is staged last.
+	var iloComponent *SPPManifestEntry
+	var hostComponents []SPPManifestEntry
+	for i := range components {
+		if isILOComponent(components[i]) {
+			c := components[i]
+			iloComponent = &c
+		} else {
+			hostComponents = append(hostComponents, components[i])
+		}
+	}
+
+	// Stage all non-iLO components first.
+	for _, pkg := range hostComponents {
 		if err := updater.EnsurePoweredOn(ctx); err != nil {
-			return nil, skipped, fmt.Errorf("failed to ensure host powered on before staging %s: %w", pkg.Name, err)
+			return nil, skipped, hasDirectApply, fmt.Errorf("failed to ensure host powered on before staging %s: %w", pkg.Name, err)
 		}
 		packageURI := fw.Spec.Repository.BaseURI + "/" + pkg.PackagePath
 		filename, err := updater.AddFromUri(ctx, packageURI)
@@ -650,15 +670,43 @@ func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *sys
 				skipped = append(skipped, fmt.Sprintf("%s (%s): %v", pkg.Name, pkg.PackagePath, err))
 				continue
 			}
-			return nil, skipped, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
+			return nil, skipped, hasDirectApply, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
 		}
 		if filename != "" {
-			// Firmware staged in ComponentRepository — include in InstallSet ApplyUpdate.
 			filenames = append(filenames, filename)
+		} else {
+			hasDirectApply = true
 		}
-		// filename == "": firmware staged directly (BIOS/System ROM); server reboot applies it.
 	}
-	return filenames, skipped, nil
+
+	// Stage iLO last. iLO self-flashes immediately on AddFromUri and reboots the BMC (host stays on).
+	// ComponentRepository entries from the non-iLO staging above survive the BMC reboot (proven).
+	// iLO is NOT added to filenames — it self-applies and must not appear in the InstallSet.
+	if iloComponent != nil {
+		packageURI := fw.Spec.Repository.BaseURI + "/" + iloComponent.PackagePath
+		log.Info("Staging iLO firmware last; BMC will reboot after self-flash", "package", iloComponent.PackagePath)
+		if _, err := updater.AddFromUri(ctx, packageURI); err != nil && !isTransientILOError(err) {
+			return nil, skipped, hasDirectApply, fmt.Errorf("failed to stage iLO firmware via AddFromUri: %w", err)
+		}
+		log.Info("iLO firmware staged; waiting for BMC to come back online")
+		if err := updater.WaitForILOOnline(ctx); err != nil {
+			return nil, skipped, hasDirectApply, fmt.Errorf("iLO did not come back online after firmware update: %w", err)
+		}
+		log.Info("iLO is back online after firmware self-update")
+	}
+
+	return filenames, skipped, hasDirectApply, nil
+}
+
+// isILOComponent reports whether a manifest entry is the iLO BMC firmware package.
+// iLO self-flashes on AddFromUri and reboots the BMC, so it is handled separately from
+// host-side components (NIC, NS204i, System ROM).
+func isILOComponent(pkg SPPManifestEntry) bool {
+	nameLower := strings.ToLower(pkg.Name)
+	pathLower := strings.ToLower(pkg.PackagePath)
+	return strings.Contains(nameLower, "ilo") ||
+		strings.Contains(nameLower, "integrated lights-out") ||
+		strings.HasPrefix(pathLower, "ilo")
 }
 
 // isComponentStagingRejection reports whether an AddFromUri error is iLO rejecting this specific
@@ -698,6 +746,13 @@ func (r *FirmwareUpdateHPEReconciler) handleInstallSet(ctx context.Context, fw *
 // processInProgressState polls iLO's UpdateTaskQueue and drives convergence once all tasks finish.
 func (r *FirmwareUpdateHPEReconciler) processInProgressState(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, updater hpeRepositoryUpdater) (bool, error) {
 	log := ctrl.LoggerFrom(ctx)
+
+	// iLO-only update: no InstallSet was created (iLO self-applied, no server reboot needed).
+	// Skip task polling and go straight to convergence check.
+	if fw.Status.InstallSetURI == "" {
+		log.Info("No InstallSet URI — iLO-only update; proceeding directly to convergence check")
+		return r.handleConvergence(ctx, fw, updater)
+	}
 
 	tasks, err := updater.GetInstallSetTasks(ctx, fw.Status.InstallSetURI)
 	if err != nil {
