@@ -86,8 +86,10 @@ type hpeRepositoryUpdater interface {
 	AddFromUri(ctx context.Context, packageURI string) (string, error)
 
 	// CreateInstallSet creates a new InstallSet in iLO containing one ApplyUpdate entry per component
-	// filename plus a final ResetServer step. Returns the Redfish URI of the created InstallSet.
-	CreateInstallSet(ctx context.Context, name string, componentFilenames []string) (string, error)
+	// filename. When includeResetServer is true a final ResetServer step is appended (needed to
+	// activate host firmware); pass false for an iLO-only update that needs no host reboot. Returns
+	// the Redfish URI of the created InstallSet.
+	CreateInstallSet(ctx context.Context, name string, componentFilenames []string, includeResetServer bool) (string, error)
 
 	// InvokeInstallSet invokes the InstallSet at installSetURI, scheduling all component updates and the
 	// server reboot. Returns the Redfish URI of the invocation task in the UpdateTaskQueue.
@@ -115,10 +117,6 @@ type hpeRepositoryUpdater interface {
 	// it with "this update requires system power ON" — but the ServerMaintenance park leaves the
 	// server powered off. No-op when the server is already on.
 	EnsurePoweredOn(ctx context.Context) error
-
-	// WaitForILOOnline polls the Redfish root resource until iLO responds. Used after flashing
-	// iLO firmware to wait for the BMC to come back online before proceeding with other components.
-	WaitForILOOnline(ctx context.Context) error
 }
 
 // newHPERepositoryUpdater returns a real hpeRepositoryUpdater backed by the HPE iLO Redfish API.

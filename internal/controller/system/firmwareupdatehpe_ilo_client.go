@@ -401,7 +401,11 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 	}
 
 	// POST AddFromUri with retry for ComponentUploadAlreadyInProgress.
-	body := map[string]string{"ImageURI": packageURI}
+	// Stage-only: UpdateRepository=true keeps the component in the ComponentRepository and
+	// UpdateTarget=false means iLO does NOT flash it during staging. The actual flash is driven
+	// later by the InstallSet (mirrors HPE OneView). This is essential for the iLO package itself:
+	// without UpdateTarget=false iLO self-flashes and resets the BMC mid-staging.
+	body := map[string]any{"ImageURI": packageURI, "UpdateRepository": true, "UpdateTarget": false}
 	posted := false
 	for attempt := 0; attempt < 10; attempt++ {
 		resp, err := c.post(ctx, actionPath, body)
@@ -490,9 +494,9 @@ func (c *iloClient) AddFromUri(ctx context.Context, packageURI string) (string, 
 	return "", fmt.Errorf("AddFromUri %s: timed out waiting for task %s to complete", packageURI, taskURI)
 }
 
-// CreateInstallSet creates an HPE InstallSet with one ApplyUpdate entry per filename
+// CreateInstallSet creates an HPE InstallSet with one ApplyUpdate entry per filename, optionally
 // followed by a ResetServer step. Returns the Redfish path of the created resource.
-func (c *iloClient) CreateInstallSet(ctx context.Context, name string, componentFilenames []string) (string, error) {
+func (c *iloClient) CreateInstallSet(ctx context.Context, name string, componentFilenames []string, includeResetServer bool) (string, error) {
 	const installSetsPath = "/redfish/v1/UpdateService/InstallSets"
 
 	// iLO rejects the create with Base.1.18.ResourceAlreadyExists when an InstallSet with the
@@ -512,10 +516,12 @@ func (c *iloClient) CreateInstallSet(ctx context.Context, name string, component
 			Command:     "ApplyUpdate",
 		})
 	}
-	seq = append(seq, iloInstallSetSequenceEntry{
-		Name:    "ResetServer",
-		Command: "ResetServer",
-	})
+	if includeResetServer {
+		seq = append(seq, iloInstallSetSequenceEntry{
+			Name:    "ResetServer",
+			Command: "ResetServer",
+		})
+	}
 
 	resp, err := c.post(ctx, installSetsPath, iloInstallSetBody{Name: name, Sequence: seq})
 	if err != nil {
@@ -717,23 +723,4 @@ func (c *iloClient) EnsurePoweredOn(ctx context.Context) error {
 		}
 	}
 	return fmt.Errorf("EnsurePoweredOn: timed out waiting for host to power on and finish POST")
-}
-
-// WaitForILOOnline polls the Redfish root resource until iLO responds, tolerating the
-// connection drop that occurs while iLO is rebooting after a self-firmware-update.
-// Returns nil once iLO is reachable again.
-func (c *iloClient) WaitForILOOnline(ctx context.Context) error {
-	const maxAttempts = 60 // 60 × 10s = 10 min
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		var root struct{}
-		if err := c.get(ctx, "/redfish/v1/", &root); err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
-	}
-	return fmt.Errorf("WaitForILOOnline: timed out after %d attempts waiting for iLO to come back online", maxAttempts)
 }
