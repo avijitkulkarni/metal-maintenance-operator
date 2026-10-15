@@ -292,7 +292,8 @@ func localizedString(entries []sppLocalizedText, lang string) string {
 
 // iloComponentEntry represents a single entry in iLO's ComponentRepository.
 type iloComponentEntry struct {
-	Filename string `json:"Filename"`
+	Filename    string   `json:"Filename"`
+	UpdatableBy []string `json:"UpdatableBy"`
 }
 
 // getComponentFilenames returns the current set of Filename values in the ComponentRepository.
@@ -310,6 +311,29 @@ func (c *iloClient) getComponentFilenames(ctx context.Context) (map[string]struc
 		}
 		if entry.Filename != "" {
 			result[entry.Filename] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+// getComponentUpdatableBy returns a map of ComponentRepository Filename → UpdatableBy agents
+// (e.g. "Bmc", "Uefi", "RuntimeAgent"). An InstallSet sequence entry must declare the same
+// updater the component itself reports, otherwise iLO waits for an agent that never acts and the
+// task sits Pending indefinitely (e.g. injecting "Uefi" for a Bmc-only component stalls the queue).
+func (c *iloClient) getComponentUpdatableBy(ctx context.Context) (map[string][]string, error) {
+	const repoPath = "/redfish/v1/UpdateService/ComponentRepository"
+	var coll iloCollection
+	if err := c.get(ctx, repoPath, &coll); err != nil {
+		return nil, fmt.Errorf("listing ComponentRepository: %w", err)
+	}
+	result := make(map[string][]string, len(coll.Members))
+	for _, m := range coll.Members {
+		var entry iloComponentEntry
+		if err := c.get(ctx, m.ODataID, &entry); err != nil {
+			return nil, fmt.Errorf("fetching ComponentRepository entry %s: %w", m.ODataID, err)
+		}
+		if entry.Filename != "" && len(entry.UpdatableBy) > 0 {
+			result[entry.Filename] = entry.UpdatableBy
 		}
 	}
 	return result, nil
@@ -507,12 +531,27 @@ func (c *iloClient) CreateInstallSet(ctx context.Context, name string, component
 		return "", fmt.Errorf("CreateInstallSet %s: clearing pre-existing InstallSet: %w", name, err)
 	}
 
+	// Each sequence entry must declare the SAME updater the component itself reports in the
+	// ComponentRepository. iLO starts a queued task only when the declared agent acts; declaring an
+	// agent the component does not support (e.g. "Uefi" for a Bmc-only firmware package) makes iLO
+	// wait for an updater that never runs, so the task — and everything queued behind it — sits
+	// Pending indefinitely. HPE's own System Recovery Set tags these firmware components ["Bmc"].
+	updatableBy, err := c.getComponentUpdatableBy(ctx)
+	if err != nil {
+		return "", fmt.Errorf("CreateInstallSet %s: reading component updaters: %w", name, err)
+	}
+
 	seq := make([]iloInstallSetSequenceEntry, 0, len(componentFilenames)+1)
 	for _, fn := range componentFilenames {
+		agents := updatableBy[fn]
+		if len(agents) == 0 {
+			// Fall back to Bmc (iLO self-apply) when the component did not report an updater.
+			agents = []string{"Bmc"}
+		}
 		seq = append(seq, iloInstallSetSequenceEntry{
 			Name:        path.Base(fn),
 			Filename:    fn,
-			UpdatableBy: []string{"Bmc", "Uefi"},
+			UpdatableBy: agents,
 			Command:     "ApplyUpdate",
 		})
 	}
