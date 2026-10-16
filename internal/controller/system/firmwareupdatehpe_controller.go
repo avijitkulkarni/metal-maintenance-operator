@@ -774,7 +774,7 @@ func (r *FirmwareUpdateHPEReconciler) processInProgressState(ctx context.Context
 	if onlyResetServerPending(tasks) {
 		log.Info("All firmware tasks complete; driving server reset directly via ComputerSystem.Reset")
 		for _, t := range tasks {
-			if t.State != "Completed" {
+			if t.State != "Completed" && t.State != "Complete" {
 				if delErr := updater.DeleteTask(ctx, t.URI); delErr != nil {
 					log.Error(delErr, "Failed to delete stuck ResetServer task; proceeding with reset anyway", "uri", t.URI)
 				}
@@ -808,7 +808,7 @@ func buildTaskStatus(tasks []HPETaskStatus) ([]systemv1alpha1.HPEUpdateTask, sys
 			Message:         t.Message,
 		})
 		switch t.State {
-		case "Completed":
+		case "Completed", "Complete":
 			summary.Completed++
 		case "Exception", "Killed", "Cancelled":
 			summary.Failed++
@@ -827,7 +827,7 @@ func onlyResetServerPending(tasks []HPETaskStatus) bool {
 	hasResetServer := false
 	for _, t := range tasks {
 		switch t.State {
-		case "Completed":
+		case "Completed", "Complete":
 			// Already done — fine.
 		case "Exception", "Killed", "Cancelled":
 			// A failed task is present; let the failure handler deal with it.
