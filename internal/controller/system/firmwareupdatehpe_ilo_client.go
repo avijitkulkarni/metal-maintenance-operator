@@ -376,28 +376,22 @@ func (c *iloClient) getTaskQueueURIs(ctx context.Context) (map[string]struct{}, 
 	return result, nil
 }
 
-// checkComponentAfterStaging checks whether the staged file appeared in ComponentRepository.
-// Returns the Filename for use in an InstallSet ApplyUpdate entry, or "" if the firmware was
-// staged directly (e.g. System ROM/BIOS) and does not appear in ComponentRepository.
+// checkComponentAfterStaging returns the ComponentRepository Filename for the package that was just
+// staged, matched by filename (basename). Returns "" only if the package is genuinely not in the
+// repository. Matching by filename is deterministic and works whether or not the component was
+// already present before staging — unlike a before/after "newly appeared" check, which fails for a
+// package that was already in the repository (it would be mis-classified and dropped).
 func (c *iloClient) checkComponentAfterStaging(ctx context.Context, packageURI string, before map[string]struct{}) (string, error) {
 	after, err := c.getComponentFilenames(ctx)
 	if err != nil {
 		return "", fmt.Errorf("reading ComponentRepository after staging %s: %w", packageURI, err)
 	}
-	// New entry — fresh staging.
-	for filename := range after {
-		if _, seen := before[filename]; !seen {
-			return filename, nil
-		}
-	}
-	// Fuzzy match — re-staging of a file already present (same filename, updated in-place).
 	for filename := range after {
 		if componentMatchesURI(filename, packageURI) {
 			return filename, nil
 		}
 	}
-	// File not in ComponentRepository: firmware was staged directly (e.g. BIOS/System ROM).
-	// The caller should trigger a server reboot without an ApplyUpdate step.
+	// Not found in ComponentRepository.
 	return "", nil
 }
 

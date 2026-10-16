@@ -655,9 +655,15 @@ func (r *FirmwareUpdateHPEReconciler) handleStaging(ctx context.Context, fw *sys
 			}
 			return nil, skipped, fmt.Errorf("failed to stage %s via AddFromUri: %w", pkg.Name, err)
 		}
-		if filename != "" {
-			filenames = append(filenames, filename)
+		// Stage-only staging puts every component in the ComponentRepository, so each must get an
+		// InstallSet ApplyUpdate entry. AddFromUri's repo-detection can fail to resolve a filename
+		// for a package that was already present in the repository (returns ""), which would wrongly
+		// drop it from the InstallSet. The component is stored under its package basename, so fall
+		// back to that to guarantee every staged component is included.
+		if filename == "" {
+			filename = path.Base(pkg.PackagePath)
 		}
+		filenames = append(filenames, filename)
 	}
 	return filenames, skipped, nil
 }
