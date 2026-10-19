@@ -847,6 +847,18 @@ func onlyResetServerPending(tasks []HPETaskStatus) bool {
 func (r *FirmwareUpdateHPEReconciler) handleConvergence(ctx context.Context, fw *systemv1alpha1.FirmwareUpdateHPE, updater hpeRepositoryUpdater) (bool, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// Wait for the host to finish rebooting and POSTing before re-reading firmware versions. After
+	// the activating reset, host-side firmware (NIC, NS204i, System ROM) only reports its NEW version
+	// once the server is powered on and POST completes. Diffing earlier reads stale inventory, falsely
+	// sees components as still outdated, and triggers a redundant extra pass (which then jams because
+	// this pass's InstallSet still locks those components).
+	if err := updater.EnsurePoweredOn(ctx); err != nil {
+		if isTransientILOError(err) {
+			return false, err
+		}
+		return false, r.transitionFailed(ctx, fw, fmt.Sprintf("failed to wait for host power/POST before convergence diff: %v", err))
+	}
+
 	var username, password string
 	if fw.Spec.Repository.SecretRef != nil {
 		var err error
@@ -905,6 +917,14 @@ func (r *FirmwareUpdateHPEReconciler) handleConvergence(ctx context.Context, fw 
 
 	// Another pass needed: clear current Install Set state and transition back to Pending.
 	log.V(1).Info("Firmware diff non-empty after convergence, starting another pass", "passCount", fw.Status.PassCount, "remaining", len(components))
+	// Delete this pass's InstallSet from iLO before the next pass re-stages. An InstallSet locks the
+	// components it references, so leaving it would make the next pass's AddFromUri fail with
+	// "File is locked, cannot be written". Clearing only the status field is not enough.
+	if fw.Status.InstallSetURI != "" {
+		if err := updater.DeleteInstallSet(ctx, fw.Status.InstallSetURI); err != nil {
+			log.Error(err, "Failed to delete previous InstallSet before next pass; components may stay locked", "installSetURI", fw.Status.InstallSetURI)
+		}
+	}
 	fwBase = fw.DeepCopy()
 	fw.Status.InstallSetURI = ""
 	fw.Status.InvokeTaskURI = ""
